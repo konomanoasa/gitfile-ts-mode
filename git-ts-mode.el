@@ -35,6 +35,7 @@
 ;;; Code:
 
 (require 'elec-pair)
+(require 'newcomment)
 (require 'treesit)
 
 (defgroup git-ts nil
@@ -140,7 +141,30 @@
   (setq-local syntax-propertize-function
               #'git-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
-            #'syntax-propertize-wholelines nil t)
+            #'syntax-propertize-wholelines nil t))
+
+;;;; Comment Commands
+
+(defun git-ts-mode-comment--uncomment-region (beg end &optional arg)
+  "Uncomment BEG through END using syntax classified before editing.
+Pass ARG to `uncomment-region-default'."
+  (syntax-propertize end)
+  (unwind-protect
+      (let ((syntax-propertize-function nil))
+        (uncomment-region-default beg end arg))
+    (syntax-ppss-flush-cache beg)))
+
+(defun git-ts-mode-comment--insert-comment ()
+  "Insert a standalone comment at a line boundary."
+  (beginning-of-line)
+  (if (looking-at-p "[ \t]*$")
+      (delete-horizontal-space)
+    (save-excursion (insert "\n")))
+  (insert (comment-padright comment-start))
+  (indent-according-to-mode))
+
+(defun git-ts-mode-comment--setup ()
+  "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
   (let ((language (treesit-parser-language treesit-primary-parser)))
@@ -150,6 +174,9 @@
                   ('gitattributes "#[ \t]*")
                   ('gitconfig "[#;][ \t]*")))
     (setq-local comment-use-syntax t)
+    (setq-local uncomment-region-function #'git-ts-mode-comment--uncomment-region)
+    (unless (eq language 'gitconfig)
+      (setq-local comment-insert-comment-function #'git-ts-mode-comment--insert-comment))
     (setq-local comment-column 0)
     (when (eq language 'gitignore)
       (setq-local comment-style 'plain))))
@@ -159,7 +186,10 @@
 (defun git-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
   (setq-local electric-pair-pairs
-              (append electric-pair-pairs '((?\[ . ?\]))))
+              (append electric-pair-pairs '((?\[ . ?\]))
+                      (when (memq (treesit-parser-language treesit-primary-parser)
+                                  '(gitattributes gitconfig))
+                        '((?\" . ?\")))))
   (setq-local electric-pair-open-newline-between-pairs nil))
 
 ;;;; Font Lock
@@ -378,6 +408,7 @@
     (git-ts-mode--ensure-grammar language)
     (setq-local treesit-primary-parser (treesit-parser-create language)))
   (git-ts-mode-syntax--setup)
+  (git-ts-mode-comment--setup)
   (git-ts-mode-electric-pair--setup)
   (git-ts-mode-font-lock--setup)
   (git-ts-mode-navigation--setup)
