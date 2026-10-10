@@ -1,4 +1,4 @@
-;;; git-ts-mode.el --- Tree-sitter mode for Git files  -*- lexical-binding: t; -*-
+;;; gitfile-ts-mode.el --- Tree-sitter mode for Git files  -*- lexical-binding: t; -*-
 ;;
 ;; Copyright (C) 2026 konomanoasa
 ;;
@@ -7,7 +7,7 @@
 ;; Version: 0.1.0
 ;; Package-Requires: ((emacs "31.1"))
 ;; Keywords: languages
-;; URL: https://github.com/konomanoasa/git-ts-mode
+;; URL: https://github.com/konomanoasa/gitfile-ts-mode
 ;;
 ;; Permission is hereby granted, free of charge, to any person obtaining
 ;; a copy of this software and associated documentation files (the
@@ -38,54 +38,76 @@
 (require 'newcomment)
 (require 'treesit)
 
-(defgroup git-ts nil
+(defgroup gitfile-ts nil
   "Tree-sitter mode for Git files."
   :group 'languages)
 
 ;;;; Grammar
 
-(defconst git-ts-mode--grammar-sources
+(defconst gitfile-ts-mode--grammar-sources
   '((gitignore "https://github.com/konomanoasa/tree-sitter-gitignore"
-               :revision "v0.2.0")
+               :revision "v0.3.0")
     (gitattributes "https://github.com/konomanoasa/tree-sitter-gitattributes"
-                   :revision "v0.2.0")
+                   :revision "v0.3.0")
     (gitconfig "https://github.com/konomanoasa/tree-sitter-gitconfig"
-               :revision "v0.2.0"))
+               :revision "v0.3.0")
+    (mailmap "https://github.com/konomanoasa/tree-sitter-mailmap"
+             :revision "v0.2.0"))
   "Tree-sitter grammar sources for Git files.")
 
-(defun git-ts-mode--ensure-grammar (language)
+(defun gitfile-ts-mode--ensure-grammar (language)
   "Ensure that the grammar for LANGUAGE is installed."
   (let ((treesit-language-source-alist
          (if (assq language treesit-language-source-alist)
              treesit-language-source-alist
-           (cons (assq language git-ts-mode--grammar-sources)
+           (cons (assq language gitfile-ts-mode--grammar-sources)
                  treesit-language-source-alist))))
     (or (treesit-ensure-installed language)
         (user-error "Tree-sitter grammar `%s' is unavailable" language))))
 
-(defun git-ts-mode--language ()
+(defun gitfile-ts-mode--language ()
   "Return the Tree-sitter language selected by the file name."
   (let ((name (and buffer-file-name (file-name-nondirectory buffer-file-name))))
     (or (and name
              (cond
               ((string-suffix-p ".gitignore" name) 'gitignore)
               ((string-suffix-p ".gitattributes" name) 'gitattributes)
-              ((string-suffix-p ".gitconfig" name) 'gitconfig)))
+              ((or (string-suffix-p ".gitconfig" name)
+                   (string-suffix-p ".gitmodules" name)) 'gitconfig)
+              ((string-suffix-p ".mailmap" name) 'mailmap)))
         (user-error "Cannot select a Git grammar for file name %S" name))))
+
+(defun gitfile-ts-mode--after-change (beg _end old-length)
+  "Reparse a BOM moved to the start by an edit at BEG of OLD-LENGTH."
+  (when (and (= beg 1) (> old-length 0))
+    (save-restriction
+      (widen)
+      (when (eq (char-after 1) #xfeff)
+        (let* ((parser treesit-primary-parser)
+               (language (treesit-parser-language parser))
+               (notifiers (treesit-parser-notifiers parser))
+               (level (treesit-parser-embed-level parser)))
+          (treesit-parser-delete parser)
+          (setq treesit-primary-parser (treesit-parser-create language))
+          (treesit-parser-set-embed-level treesit-primary-parser level)
+          (dolist (notifier notifiers)
+            (treesit-parser-add-notifier treesit-primary-parser notifier))
+          (syntax-ppss-flush-cache 1)
+          (font-lock-flush))))))
 
 ;;;; Syntax
 
-(defvar git-ts-mode-syntax-table
+(defvar gitfile-ts-mode-syntax-table
   (let ((table (make-syntax-table prog-mode-syntax-table)))
-    (dolist (character '(?# ?\; ?\" ?\' ?` ?\\ ?\( ?\) ?\[ ?\] ?{ ?} ?: ?. ?=))
+    (dolist (character '(?# ?\; ?\" ?\' ?` ?\\ ?\( ?\) ?\[ ?\] ?{ ?} ?< ?> ?: ?. ?=))
       (modify-syntax-entry character "." table))
     (modify-syntax-entry ?\n ">" table)
     table)
-  "Syntax table for `git-ts-mode'.")
+  "Syntax table for `gitfile-ts-mode'.")
 
 ;;;;; Syntax Queries
 
-(defconst git-ts-mode-syntax--queries
+(defconst gitfile-ts-mode-syntax--queries
   (mapcar (lambda (source)
             (let ((language (car source)))
               (cons language
@@ -93,9 +115,14 @@
                      language
                      (append
                       '((comment_marker) @comment)
-                      (if (eq language 'gitconfig)
-                          '((section_open) @square-open
-                            (section_close) @square-close)
+                      (cond
+                       ((eq language 'gitconfig)
+                        '((section_open) @square-open
+                          (section_close) @square-close))
+                       ((eq language 'mailmap)
+                        '((email_open) @angle-open
+                          (email_close) @angle-close))
+                       (t
                         '(((character_class "[" @square-open)
                            (:equal @square-open "["))
                           ((set_open) @square-open
@@ -103,13 +130,13 @@
                           ((set_close) @square-close
                            (:equal @square-close "]"))
                           ((character_class "]" @square-close)
-                           (:equal @square-close "]")))))))))
-          git-ts-mode--grammar-sources)
+                           (:equal @square-close "]"))))))))))
+          gitfile-ts-mode--grammar-sources)
   "Compiled syntax queries by language for Git files.")
 
 ;;;;; Propertization
 
-(defun git-ts-mode-syntax--propertize (start end)
+(defun gitfile-ts-mode-syntax--propertize (start end)
   "Apply syntax properties between START and END."
   (let ((accessible-start (point-min)))
     (save-restriction
@@ -122,13 +149,15 @@
       (dolist (capture (treesit-query-capture
                         (treesit-parser-root-node treesit-primary-parser)
                         (alist-get (treesit-parser-language treesit-primary-parser)
-                                   git-ts-mode-syntax--queries)
+                                   gitfile-ts-mode-syntax--queries)
                         start end))
         (let ((node (cdr capture))
               (syntax (pcase (car capture)
                         ('comment "<")
                         ('square-open "(]")
-                        ('square-close ")["))))
+                        ('square-close ")[")
+                        ('angle-open "(>")
+                        ('angle-close ")<"))))
           (unless (or (= (treesit-node-start node) (treesit-node-end node))
                       (treesit-node-check node 'missing))
             (put-text-property (treesit-node-start node) (treesit-node-end node)
@@ -136,16 +165,16 @@
 
 ;;;;; Setup
 
-(defun git-ts-mode-syntax--setup ()
+(defun gitfile-ts-mode-syntax--setup ()
   "Configure syntax handling for the current buffer."
   (setq-local syntax-propertize-function
-              #'git-ts-mode-syntax--propertize)
+              #'gitfile-ts-mode-syntax--propertize)
   (add-hook 'syntax-propertize-extend-region-functions
             #'syntax-propertize-wholelines nil t))
 
 ;;;; Comment Commands
 
-(defun git-ts-mode-comment--uncomment-region (beg end &optional arg)
+(defun gitfile-ts-mode-comment--uncomment-region (beg end &optional arg)
   "Uncomment BEG through END using syntax classified before editing.
 Pass ARG to `uncomment-region-default'."
   (syntax-propertize end)
@@ -154,7 +183,7 @@ Pass ARG to `uncomment-region-default'."
         (uncomment-region-default beg end arg))
     (syntax-ppss-flush-cache beg)))
 
-(defun git-ts-mode-comment--insert-comment ()
+(defun gitfile-ts-mode-comment--insert-comment ()
   "Insert a standalone comment at a line boundary."
   (beginning-of-line)
   (if (looking-at-p "[ \t]*$")
@@ -163,7 +192,7 @@ Pass ARG to `uncomment-region-default'."
   (insert (comment-padright comment-start))
   (indent-according-to-mode))
 
-(defun git-ts-mode-comment--setup ()
+(defun gitfile-ts-mode-comment--setup ()
   "Configure comment commands for the current buffer."
   (setq-local comment-start "# ")
   (setq-local comment-end "")
@@ -172,21 +201,25 @@ Pass ARG to `uncomment-region-default'."
                 (pcase language
                   ('gitignore "# ?")
                   ('gitattributes "#[ \t]*")
-                  ('gitconfig "[#;][ \t]*")))
+                  ('gitconfig "[#;][ \t]*")
+                  ('mailmap "#[ \t]*")))
     (setq-local comment-use-syntax t)
-    (setq-local uncomment-region-function #'git-ts-mode-comment--uncomment-region)
-    (unless (eq language 'gitconfig)
-      (setq-local comment-insert-comment-function #'git-ts-mode-comment--insert-comment))
+    (setq-local uncomment-region-function #'gitfile-ts-mode-comment--uncomment-region)
+    (unless (memq language '(gitconfig mailmap))
+      (setq-local comment-insert-comment-function #'gitfile-ts-mode-comment--insert-comment))
     (setq-local comment-column 0)
     (when (eq language 'gitignore)
       (setq-local comment-style 'plain))))
 
 ;;;; Electric Pair
 
-(defun git-ts-mode-electric-pair--setup ()
+(defun gitfile-ts-mode-electric-pair--setup ()
   "Configure electric pairing for the current buffer."
   (setq-local electric-pair-pairs
-              (append electric-pair-pairs '((?\[ . ?\]))
+              (append electric-pair-pairs
+                      (if (eq (treesit-parser-language treesit-primary-parser) 'mailmap)
+                          '((?< . ?>))
+                        '((?\[ . ?\])))
                       (when (memq (treesit-parser-language treesit-primary-parser)
                                   '(gitattributes gitconfig))
                         '((?\" . ?\")))))
@@ -196,7 +229,7 @@ Pass ARG to `uncomment-region-default'."
 
 ;;;;; Features
 
-(defconst git-ts-mode-font-lock--feature-lists
+(defconst gitfile-ts-mode-font-lock--feature-lists
   '((gitignore
      (comment)
      (string)
@@ -211,12 +244,17 @@ Pass ARG to `uncomment-region-default'."
      (comment)
      (type property string)
      (escape)
-     (operator punctuation bracket)))
+     (operator punctuation bracket))
+    (mailmap
+     (comment)
+     (string)
+     ()
+     (bracket)))
   "Font-lock features by language and decoration level.")
 
 ;;;;; Settings
 
-(defun git-ts-mode-font-lock--settings (language)
+(defun gitfile-ts-mode-font-lock--settings (language)
   "Return font-lock settings for LANGUAGE."
   (append
    (treesit-font-lock-rules
@@ -225,31 +263,40 @@ Pass ARG to `uncomment-region-default'."
     :feature 'comment
     '([(comment_marker) (comment_text)] @font-lock-comment-face))
 
-   (if (eq language 'gitconfig)
-       (treesit-font-lock-rules
-        :default-language language
+   (cond
+    ((eq language 'mailmap)
+     (treesit-font-lock-rules
+      :default-language language
+      :feature 'string
+      '([(name_text) (email_text)] @font-lock-string-face)
+      :feature 'bracket
+      '([(email_open) (email_close)] @font-lock-bracket-face)))
+    ((eq language 'gitconfig)
+     (treesit-font-lock-rules
+      :default-language language
 
-        :feature 'type
-        '((section_name (name_text) @font-lock-type-face))
+      :feature 'type
+      '((section_name (name_text) @font-lock-type-face))
 
-        :feature 'property
-        '((variable_name (name_text) @font-lock-property-name-face))
+      :feature 'property
+      '((variable_name (name_text) @font-lock-property-name-face))
 
-        :feature 'string
-        '([(subsection_text) (value_text) (quote_open) (quote_close)]
-          @font-lock-string-face)
+      :feature 'string
+      '([(subsection_text) (value_text) (quote_open) (quote_close)]
+        @font-lock-string-face)
 
-        :feature 'escape
-        '([(escape) (line_continuation)] @font-lock-escape-face)
+      :feature 'escape
+      '([(escape) (line_continuation)] @font-lock-escape-face)
 
-        :feature 'operator
-        '((assignment_operator) @font-lock-operator-face)
+      :feature 'operator
+      '((assignment_operator) @font-lock-operator-face)
 
-        :feature 'punctuation
-        '((subsection_separator) @font-lock-punctuation-face)
+      :feature 'punctuation
+      '((subsection_separator) @font-lock-punctuation-face)
 
-        :feature 'bracket
-        '([(section_open) (section_close)] @font-lock-bracket-face))
+      :feature 'bracket
+      '([(section_open) (section_close)] @font-lock-bracket-face)))
+    (t
      (append
       (treesit-font-lock-rules
        :default-language language
@@ -302,22 +349,22 @@ Pass ARG to `uncomment-region-default'."
 
          :feature 'operator
          '((assignment_operator) @font-lock-operator-face
-           [(unset_marker) (unspecified_marker)] @font-lock-negation-char-face)))))))
+           [(unset_marker) (unspecified_marker)] @font-lock-negation-char-face))))))))
 
 ;;;;; Setup
 
-(defun git-ts-mode-font-lock--setup ()
+(defun gitfile-ts-mode-font-lock--setup ()
   "Configure font lock for the current buffer."
   (setq-local treesit-font-lock-feature-list
               (alist-get (treesit-parser-language treesit-primary-parser)
-                         git-ts-mode-font-lock--feature-lists))
+                         gitfile-ts-mode-font-lock--feature-lists))
   (setq-local treesit-font-lock-settings
-              (git-ts-mode-font-lock--settings
+              (gitfile-ts-mode-font-lock--settings
                (treesit-parser-language treesit-primary-parser))))
 
 ;;;; Navigation
 
-(defconst git-ts-mode-navigation--settings
+(defconst gitfile-ts-mode-navigation--settings
   `((gitignore (sexp "^pattern$"))
     (gitattributes
      (sexp ,(rx string-start
@@ -330,18 +377,21 @@ Pass ARG to `uncomment-region-default'."
                 (or "section" "variable" "section_name" "subsection"
                     "variable_name" "value")
                 string-end))
-     (defun "^section$")))
+     (defun "^section$"))
+    (mailmap
+     (sexp ,(rx string-start (or "mapping" "name" "email") string-end))
+     (defun "^mapping$")))
   "Tree-sitter thing definitions for Git files.")
 
-(defun git-ts-mode-navigation--setup ()
+(defun gitfile-ts-mode-navigation--setup ()
   "Configure navigation for the current buffer."
   (setq-local treesit-thing-settings
-              git-ts-mode-navigation--settings)
+              gitfile-ts-mode-navigation--settings)
   (setq-local treesit-defun-skipper nil))
 
 ;;;; Imenu
 
-(defun git-ts-mode-imenu--name (node)
+(defun gitfile-ts-mode-imenu--name (node)
   "Return the source name of NODE, or nil if it has no name."
   (pcase (treesit-node-type node)
     ("section"
@@ -358,74 +408,86 @@ Pass ARG to `uncomment-region-default'."
                     (treesit-node-text subsection t)))))))
     ("macro_definition"
      (let ((name (treesit-node-child-by-field-name node "name")))
+       (when name (treesit-node-text name t))))
+    ("mapping"
+     (let ((name (or (treesit-node-child-by-field-name node "canonical_name")
+                     (treesit-node-child-by-field-name node "canonical_email"))))
        (when name (treesit-node-text name t))))))
 
-(defconst git-ts-mode-imenu--settings
+(defconst gitfile-ts-mode-imenu--settings
   '((gitattributes
-     ("Macro" "^macro_definition$" git-ts-mode-imenu--name nil))
+     ("Macro" "^macro_definition$" gitfile-ts-mode-imenu--name nil))
     (gitconfig
-     ("Section" "^section$" git-ts-mode-imenu--name nil)))
+     ("Section" "^section$" gitfile-ts-mode-imenu--name nil))
+    (mailmap
+     ("Mapping" "^mapping$" gitfile-ts-mode-imenu--name nil)))
   "Tree-sitter Imenu settings by language for Git files.")
 
-(defun git-ts-mode-imenu--setup ()
+(defun gitfile-ts-mode-imenu--setup ()
   "Configure Imenu for the current buffer."
   (setq-local treesit-defun-name-function
-              #'git-ts-mode-imenu--name)
+              #'gitfile-ts-mode-imenu--name)
   (setq-local treesit-simple-imenu-settings
               (alist-get (treesit-parser-language treesit-primary-parser)
-                         git-ts-mode-imenu--settings)))
+                         gitfile-ts-mode-imenu--settings)))
 
 ;;;; Indentation
 
-(defun git-ts-mode-indent--continuation-p (node parent bol)
+(defun gitfile-ts-mode-indent--continuation-p (node parent bol)
   "Return non-nil if NODE or PARENT at BOL is on a continued variable line."
   (let ((variable (treesit-parent-until (or node parent) "^variable$" t)))
     (and variable
          (< (treesit-node-start variable)
             (save-excursion (goto-char bol) (line-beginning-position))))))
 
-(defun git-ts-mode-indent--keep (_node _parent bol)
+(defun gitfile-ts-mode-indent--keep (_node _parent bol)
   "Return BOL to preserve the current indentation."
   bol)
 
-(defconst git-ts-mode-indent--rules
-  '((gitignore (catch-all git-ts-mode-indent--keep 0))
+(defconst gitfile-ts-mode-indent--rules
+  '((gitignore (catch-all gitfile-ts-mode-indent--keep 0))
     (gitattributes (catch-all column-0 0))
-    (gitconfig (git-ts-mode-indent--continuation-p git-ts-mode-indent--keep 0)
-               (catch-all column-0 0)))
+    (gitconfig (gitfile-ts-mode-indent--continuation-p gitfile-ts-mode-indent--keep 0)
+               (catch-all column-0 0))
+    (mailmap (catch-all column-0 0)))
   "Tree-sitter indentation rules for Git files.")
 
-(defun git-ts-mode-indent--setup ()
+(defun gitfile-ts-mode-indent--setup ()
   "Configure indentation for the current buffer."
   (setq-local treesit-simple-indent-rules
-              git-ts-mode-indent--rules))
+              gitfile-ts-mode-indent--rules))
 
 ;;;; Mode
 
-(defun git-ts-mode--setup ()
-  "Configure `git-ts-mode' in the current buffer."
-  (let ((language (git-ts-mode--language)))
-    (git-ts-mode--ensure-grammar language)
+(defun gitfile-ts-mode--setup ()
+  "Configure `gitfile-ts-mode' in the current buffer."
+  (let ((language (gitfile-ts-mode--language)))
+    (gitfile-ts-mode--ensure-grammar language)
     (setq-local treesit-primary-parser (treesit-parser-create language)))
-  (git-ts-mode-syntax--setup)
-  (git-ts-mode-comment--setup)
-  (git-ts-mode-electric-pair--setup)
-  (git-ts-mode-font-lock--setup)
-  (git-ts-mode-navigation--setup)
-  (git-ts-mode-imenu--setup)
-  (git-ts-mode-indent--setup)
-  (treesit-major-mode-setup))
+  (gitfile-ts-mode-syntax--setup)
+  (gitfile-ts-mode-comment--setup)
+  (gitfile-ts-mode-electric-pair--setup)
+  (gitfile-ts-mode-font-lock--setup)
+  (gitfile-ts-mode-navigation--setup)
+  (gitfile-ts-mode-imenu--setup)
+  (gitfile-ts-mode-indent--setup)
+  (treesit-major-mode-setup)
+  (add-hook 'after-change-functions #'gitfile-ts-mode--after-change nil t))
 
 ;;;###autoload
-(define-derived-mode git-ts-mode prog-mode "Git-TS"
+(define-derived-mode gitfile-ts-mode prog-mode "Gitfile-TS"
   "Major mode for editing Git files."
-  :syntax-table git-ts-mode-syntax-table
-  :group 'git-ts
-  (git-ts-mode--setup))
+  :syntax-table gitfile-ts-mode-syntax-table
+  :group 'gitfile-ts
+  (gitfile-ts-mode--setup))
 
 ;;;###autoload
-(add-to-list 'auto-mode-alist '("\\.git\\(?:ignore\\|attributes\\|config\\)\\'" . git-ts-mode))
+(add-to-list 'auto-mode-alist
+             (cons (rx (or (seq ".git" (or "attributes" "config" "ignore" "modules"))
+                           ".mailmap")
+                       string-end)
+                   'gitfile-ts-mode))
 
-(provide 'git-ts-mode)
+(provide 'gitfile-ts-mode)
 
-;;; git-ts-mode.el ends here
+;;; gitfile-ts-mode.el ends here
