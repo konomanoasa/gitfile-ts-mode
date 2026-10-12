@@ -35,6 +35,22 @@
 
 ;;;; Helpers
 
+(defmacro gitfile-ts-mode-test--with-file (file properties source &rest body)
+  "Evaluate BODY with SOURCE in FILE using EditorConfig PROPERTIES."
+  (declare (indent 3) (debug (form form form body)))
+  `(let ((default-directory
+          (file-name-as-directory (make-temp-file "gitfile-ts-mode-" t))))
+     (unwind-protect
+         (progn
+           (with-temp-file (expand-file-name ".editorconfig")
+             (insert "root = true\n[*]\n" ,properties))
+           (with-temp-buffer
+             (setq buffer-file-name (expand-file-name ,file))
+             (insert ,source)
+             (gitfile-ts-mode)
+             ,@body))
+       (delete-directory default-directory t))))
+
 (defun gitfile-ts-mode-test--position (fragment &optional line)
   (save-excursion
     (goto-char (point-min))
@@ -68,15 +84,22 @@
         (push (list (get-text-property position 'face) (syntax-after position)) state)))
     (nreverse state)))
 
-(defun gitfile-ts-mode-test--should-match-fresh-buffer (level)
+(defun gitfile-ts-mode-test--should-match-fresh-buffer (&optional level compare-tree)
+  "Compare classifications at LEVEL and optionally COMPARE-TREE with fresh parsing."
   (let ((source (buffer-substring-no-properties (point-min) (point-max)))
         (state (gitfile-ts-mode-test--buffer-state))
-        (file buffer-file-name))
+        (tree (when compare-tree
+                (treesit-node-string (treesit-parser-root-node treesit-primary-parser))))
+        (file buffer-file-name)
+        (level (or level treesit-font-lock-level)))
     (with-temp-buffer
       (setq buffer-file-name file)
       (insert source)
       (let ((treesit-font-lock-level level)) (gitfile-ts-mode))
-      (should (equal state (gitfile-ts-mode-test--buffer-state))))))
+      (should (equal state (gitfile-ts-mode-test--buffer-state)))
+      (when compare-tree
+        (should (equal tree (treesit-node-string
+                             (treesit-parser-root-node treesit-primary-parser))))))))
 
 ;;;; Grammar
 
@@ -855,6 +878,33 @@
 
 ;;;; Updates
 
+(ert-deftest gitfile-ts-mode-refreshes-edited-owners-without-parser-notifications ()
+  (pcase-dolist (`(,language ,file ,properties ,source ,fragment ,owner-start)
+                 '((gitignore ".gitignore" "" "foo/**\n" "foo" 1)
+                   (gitattributes ".gitattributes" "" "*.c text\n" "text" 1)
+                   (gitconfig ".gitconfig" "" "[core]\n bare = true\n" "true" 8)
+                   (mailmap ".mailmap" "" "Name <name@example.com>\n" "Name" 1)))
+    (dolist (narrow '(nil t))
+      (ert-info ((format "%s, narrowed: %s" language narrow))
+        (let ((treesit-font-lock-level 4))
+          (gitfile-ts-mode-test--with-file file properties source
+                                           (rename-buffer "gitfile-ts-mode-test" t)
+                                           (let ((noninteractive nil)) (font-lock-mode 1))
+                                           (gitfile-ts-mode-test--buffer-state)
+                                           (should (get-text-property owner-start 'fontified))
+                                           (let ((parser treesit-primary-parser))
+                                             (should-not (treesit-node-check (treesit-parser-root-node parser) 'has-error))
+                                             (dolist (notifier (treesit-parser-notifiers parser))
+                                               (treesit-parser-remove-notifier parser notifier))
+                                             (goto-char (gitfile-ts-mode-test--position fragment))
+                                             (when narrow
+                                               (narrow-to-region (line-beginning-position) (line-end-position)))
+                                             (insert "x")
+                                             (widen)
+                                             (should (eq parser treesit-primary-parser))
+                                             (should-not (get-text-property owner-start 'fontified))
+                                             (gitfile-ts-mode-test--should-match-fresh-buffer 4 t))))))))
+
 (ert-deftest gitfile-ts-mode-reparses-a-bom-moved-to-buffer-start ()
   (pcase-dolist (`(,language ,file ,properties ,prefix ,body ,fragment ,face)
                  '((gitignore ".gitignore" "" "file\n" "# note\n" "note" font-lock-comment-face)
@@ -863,41 +913,46 @@
                    (mailmap ".mailmap" "" "Name <name@example.org>\n" "# note\n" "note" font-lock-comment-face)))
     (dolist (narrow '(nil t))
       (ert-info ((format "%s, narrowed: %s" language narrow))
-        (let ((default-directory
-               (file-name-as-directory (make-temp-file "gitfile-ts-mode-" t))))
-          (unwind-protect
-              (progn
-                (with-temp-file (expand-file-name ".editorconfig")
-                  (insert "root = true\n[*]\n" properties))
-                (with-temp-buffer
-                  (setq buffer-file-name (expand-file-name file))
-                  (insert prefix "\ufeff" body)
-                  (let ((treesit-font-lock-level 4)) (gitfile-ts-mode))
-                  (gitfile-ts-mode-test--buffer-state)
-                  (when narrow
-                    (narrow-to-region 1 (+ 2 (length prefix))))
-                  (delete-region 1 (1+ (length prefix)))
-                  (widen)
-                  (should (eq (treesit-parser-language treesit-primary-parser) language))
-                  (should (equal (treesit-parser-list) (list treesit-primary-parser)))
-                  (let ((state (gitfile-ts-mode-test--buffer-state))
-                        (tree (treesit-node-string
-                               (treesit-parser-root-node treesit-primary-parser)))
-                        (source (buffer-substring-no-properties (point-min) (point-max)))
-                        (filename buffer-file-name))
-                    (should (equal source (concat "\ufeff" body)))
-                    (should-not (get-text-property 1 'face))
-                    (goto-char (point-min))
-                    (search-forward fragment)
-                    (should (eq (get-text-property (1- (point)) 'face) face))
-                    (with-temp-buffer
-                      (setq buffer-file-name filename)
-                      (insert source)
-                      (let ((treesit-font-lock-level 4)) (gitfile-ts-mode))
-                      (should (equal state (gitfile-ts-mode-test--buffer-state)))
-                      (should (equal tree (treesit-node-string
-                                           (treesit-parser-root-node treesit-primary-parser))))))))
-            (delete-directory default-directory t)))))))
+        (let ((treesit-font-lock-level 4))
+          (gitfile-ts-mode-test--with-file file properties (concat prefix "\ufeff" body)
+                                           (gitfile-ts-mode-test--buffer-state)
+                                           (when narrow (narrow-to-region 1 (+ 2 (length prefix))))
+                                           (delete-region 1 (1+ (length prefix)))
+                                           (widen)
+                                           (should (eq (treesit-parser-language treesit-primary-parser) language))
+                                           (should (equal (treesit-parser-list) (list treesit-primary-parser)))
+                                           (should (equal (buffer-substring-no-properties (point-min) (point-max))
+                                                          (concat "\ufeff" body)))
+                                           (gitfile-ts-mode-test--buffer-state)
+                                           (should-not (get-text-property 1 'face))
+                                           (goto-char (point-min))
+                                           (search-forward fragment)
+                                           (should (eq (get-text-property (1- (point)) 'face) face))
+                                           (gitfile-ts-mode-test--should-match-fresh-buffer 4 t)))))))
+
+(ert-deftest gitfile-ts-mode-preserves-attributes-control-whitespace-content ()
+  (dolist (character '(?\v ?\f))
+    (with-temp-buffer
+      (setq buffer-file-name ".gitattributes")
+      (insert (string character) "#pattern attr=one" (string character) "two\n")
+      (let ((treesit-font-lock-level 4)) (gitfile-ts-mode))
+      (font-lock-ensure)
+      (should (eq (get-text-property 1 'face) 'font-lock-string-face))
+      (should (eq (gitfile-ts-mode-test--face "#pattern") 'font-lock-string-face))
+      (should (eq (gitfile-ts-mode-test--face "attr") 'font-lock-variable-name-face))
+      (should (eq (gitfile-ts-mode-test--face (concat "one" (string character) "two") 3)
+                  'font-lock-string-face))
+      (syntax-propertize (point-max))
+      (should-not (nth 4 (syntax-ppss (gitfile-ts-mode-test--position "pattern"))))
+      (let ((source (buffer-string)))
+        (indent-region (point-min) (point-max))
+        (should (equal (buffer-string) source)))
+      (goto-char (point-min))
+      (delete-char 1)
+      (insert " ")
+      (font-lock-ensure)
+      (should (eq (gitfile-ts-mode-test--face "#pattern") 'font-lock-comment-face))
+      (gitfile-ts-mode-test--should-match-fresh-buffer 4))))
 
 (ert-deftest gitfile-ts-mode-updates-like-fresh-buffer ()
   (pcase-dolist (`(,file ,source ,old ,new)
